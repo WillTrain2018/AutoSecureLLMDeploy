@@ -1,0 +1,73 @@
+[project]
+name = "techcorp-llm-api"
+version = "1.0.0"
+description = "TechCorp LLM Inference API - Module 1 hands-on exercise covering containerization, CI/CD, and Terraform deployment on AWS"
+requires-python = ">=3.10,<3.14"
+license = { text = "Proprietary" }
+
+# Core runtime dependencies, mirrored from
+# AutoSecureLLM_Module1_Deployment/Module1_Deployment/M1_requirements.txt
+dependencies = [
+    "fastapi==0.104.1",
+    "uvicorn[standard]==0.24.0",
+    "pydantic==2.5.0",
+    "httpx==0.25.2",
+    "aiohttp==3.9.1",
+    "prometheus-client==0.19.0",
+    "python-dotenv==1.0.0",
+    "python-json-logger==2.0.7",
+]
+
+[project.optional-dependencies]
+# NOTE: the production LLM inference stack (vllm==0.2.7, torch==2.1.0,
+# transformers==4.35.0 - commented out in M1_requirements.txt) is deliberately
+# NOT declared as an extra here. vllm 0.2.7 hard-pins pydantic==1.10.13, which
+# directly conflicts with this project's pydantic==2.5.0 (required by FastAPI) -
+# the two can never resolve together in one environment, with any interpreter.
+# This mirrors real deployments: vLLM runs as its own separate inference
+# service/process (called over HTTP), never imported into the API gateway's
+# process. If/when you stand that service up, give it its own pyproject.toml
+# or requirements file and venv, independent of this one.
+#
+# Local development / test / lint tooling
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.1",
+    "ruff>=0.1.6",
+    "black>=23.11",
+    "mypy>=1.7",
+]
+
+# -----------------------------------------------------------------------------
+# This repo is a training exercise, not a distributable package: the app
+# lives under AutoSecureLLM_Module1_Deployment/Module1_Deployment/M1_app.py
+# rather than a standard src/ layout. Disable setuptools package auto-discovery
+# so `pip install -e .[dev]` just resolves dependencies into the venv.
+# -----------------------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["AutoSecureLLM_Module1_Deployment"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["AutoSecureLLM_Module1_Deployment/Module1_Deployment/Solutions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
