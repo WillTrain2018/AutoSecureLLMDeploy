@@ -1,0 +1,74 @@
+# =============================================================================
+# TechCorp LLM Application - Dockerfile Template
+# =============================================================================
+# CURRENT ISSUES (Your task is to optimize this):
+# 1. Single-stage build - includes build dependencies in final image
+# 2. No layer caching optimization - rebuilds everything on code changes
+# 3. Large base image - not optimized for production
+# 4. No .dockerignore - copies unnecessary files
+# 5. Runs as root - security concern
+# 
+# TARGET: Reduce image size from ~45GB to <20GB using multi-stage builds
+# =============================================================================
+
+# Using full CUDA image with all development tools (INEFFICIENT)
+FROM nvidia/cuda:12.1-devel-ubuntu22.04
+
+# Set working directory
+WORKDIR /app
+
+# Install Python and ALL dependencies at once (NO LAYER CACHING)
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    curl \
+    vim \
+    htop \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy EVERYTHING at once (breaks layer caching)
+COPY . .
+
+# Install Python dependencies (rebuilds on ANY file change)
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Download model weights (should be cached separately)
+# RUN python3 download_model.py
+
+# Set environment variables
+ENV MODEL_NAME=llama-3.1-8b
+ENV MODEL_VERSION=v1.0.0
+ENV PYTHONUNBUFFERED=1
+
+# Expose port
+EXPOSE 8000
+
+# Run as root (SECURITY ISSUE)
+CMD ["python3", "-m", "uvicorn", "M1_app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# =============================================================================
+# OPTIMIZATION HINTS:
+# 
+# 1. Use multi-stage build:
+#    - Stage 1 (builder): Install build dependencies, compile packages
+#    - Stage 2 (runtime): Copy only necessary files, use slim base image
+#
+# 2. Optimize layer caching:
+#    - COPY requirements.txt first
+#    - RUN pip install
+#    - COPY application code last
+#
+# 3. Use nvidia/cuda:12.1-runtime-ubuntu22.04 for final stage (smaller)
+#
+# 4. Create non-root user:
+#    - RUN useradd -m appuser
+#    - USER appuser
+#
+# 5. Add .dockerignore file to exclude:
+#    - .git, __pycache__, *.pyc, .env, tests/, docs/
+# =============================================================================

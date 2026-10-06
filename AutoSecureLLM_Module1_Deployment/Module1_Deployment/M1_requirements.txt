@@ -1,0 +1,25 @@
+# TechCorp LLM API Dependencies
+# ==============================
+
+# Web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# HTTP client for model calls
+httpx==0.25.2
+aiohttp==3.9.1
+
+# Monitoring and metrics
+prometheus-client==0.19.0
+
+# Environment and configuration
+python-dotenv==1.0.0
+
+# Utilities
+python-json-logger==2.0.7
+
+# For production LLM inference (uncomment when needed)
+# vllm==0.2.7
+# torch==2.1.0
+# transformers==4.35.0

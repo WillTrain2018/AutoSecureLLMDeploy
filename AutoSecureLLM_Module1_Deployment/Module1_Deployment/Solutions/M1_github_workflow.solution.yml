@@ -1,0 +1,355 @@
+# =============================================================================
+# TechCorp LLM CI/CD Pipeline - SOLUTION: Complete GitHub Actions Workflow
+# =============================================================================
+# This is the SOLUTION file demonstrating:
+# 1. Complete build pipeline with Docker layer caching
+# 2. Trivy security scanning with failure thresholds
+# 3. Blue-green deployment with health check validation
+# 4. Automatic rollback on failure
+# =============================================================================
+
+name: Deploy LLM Application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: techcorp-llm
+  ECS_CLUSTER: techcorp-llm-cluster
+  ECS_SERVICE: techcorp-llm-service
+
+jobs:
+  # ===========================================================================
+  # Build Stage
+  # ===========================================================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      
+      - name: Build and push Docker image
+        id: build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            MODEL_VERSION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+      
+      - name: Output image URI
+        id: output-image
+        run: |
+          echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Security Scan Stage - SOLUTION: Complete Trivy Implementation
+  # ===========================================================================
+  security-scan:
+    name: Security Scan
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image_uri }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Trivy for summary report
+        uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: ${{ needs.build.outputs.image_uri }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          ignore-unfixed: true
+
+  # ===========================================================================
+  # Deploy Stage - SOLUTION: Blue-Green Deployment
+  # ===========================================================================
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+    needs: [build, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    outputs:
+      previous_task_def: ${{ steps.get-current.outputs.task_def }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Store current task definition for rollback
+      - name: Get current task definition
+        id: get-current
+        run: |
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+          echo "Current task definition: $TASK_DEF"
+      
+      # Download and update task definition
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --query 'taskDefinition' \
+            > task-definition.json
+      
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: llm-inference
+          image: ${{ needs.build.outputs.image_uri }}
+      
+      # Blue-Green Deployment using CodeDeploy
+      - name: Deploy to Amazon ECS (Blue-Green)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          codedeploy-appspec: appspec.yaml
+          codedeploy-application: techcorp-llm-app
+          codedeploy-deployment-group: techcorp-llm-dg
+      
+      # Health check validation
+      - name: Validate deployment health
+        id: health-check
+        run: |
+          ALB_DNS="${{ secrets.ALB_DNS }}"
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          echo "Waiting for deployment to be healthy..."
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "https://${ALB_DNS}/health" || echo "000")
+            
+            if [ "$HEALTH" = "200" ]; then
+              echo "✅ Health check passed!"
+              
+              # Verify response content
+              RESPONSE=$(curl -s "https://${ALB_DNS}/health")
+              STATUS=$(echo $RESPONSE | jq -r '.status')
+              
+              if [ "$STATUS" = "healthy" ]; then
+                echo "✅ Service is healthy and ready!"
+                exit 0
+              fi
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: $HEALTH"
+            sleep 10
+          done
+          
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+          exit 1
+      
+      # Notify on success
+      - name: Notify deployment success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ LLM Deployment Successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*✅ Deployment Successful*\n*Environment:* ${{ github.event.inputs.environment || 'dev' }}\n*Image:* `${{ github.sha }}`\n*Deployed by:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ===========================================================================
+  # Rollback Stage - SOLUTION: Automatic Rollback
+  # ===========================================================================
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Rollback to previous task definition
+        run: |
+          echo "🔄 Rolling back to previous task definition..."
+          echo "Previous task def: ${{ needs.deploy.outputs.previous_task_def }}"
+          
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ needs.deploy.outputs.previous_task_def }} \
+            --force-new-deployment
+          
+          echo "⏳ Waiting for rollback to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+          
+          echo "✅ Rollback completed successfully!"
+      
+      - name: Notify rollback
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "⚠️ LLM Deployment Rolled Back",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*⚠️ Deployment Rolled Back*\n*Environment:* ${{ github.event.inputs.environment || 'dev' }}\n*Failed Image:* `${{ github.sha }}`\n*Rolled back to:* `${{ needs.deploy.outputs.previous_task_def }}`"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# =============================================================================
+# SOLUTION NOTES:
+# 
+# Key implementations:
+# 
+# 1. TRIVY SECURITY SCANNING
+#    - Scans for CRITICAL and HIGH vulnerabilities
+#    - Fails pipeline if vulnerabilities found (exit-code: '1')
+#    - Uploads results to GitHub Security tab
+#    - Ignores unfixed vulnerabilities to reduce noise
+#
+# 2. BLUE-GREEN DEPLOYMENT
+#    - Uses AWS CodeDeploy for zero-downtime deployment
+#    - Traffic shifts gradually to new version
+#    - Automatic rollback if health checks fail
+#    - Stores previous task definition for manual rollback
+#
+# 3. HEALTH CHECK VALIDATION
+#    - Waits up to 5 minutes for deployment to be healthy
+#    - Checks both HTTP status and response content
+#    - Triggers rollback on failure
+#
+# 4. AUTOMATIC ROLLBACK
+#    - Triggers automatically if deploy job fails
+#    - Reverts to previous task definition
+#    - Notifies team via Slack
+#
+# REQUIRED SECRETS:
+#   - AWS_ACCESS_KEY_ID
+#   - AWS_SECRET_ACCESS_KEY
+#   - ALB_DNS
+#   - SLACK_WEBHOOK_URL
+#
+# REQUIRED FILES:
+#   - appspec.yaml (CodeDeploy configuration)
+#   - task-definition.json (ECS task definition template)
+# =============================================================================
