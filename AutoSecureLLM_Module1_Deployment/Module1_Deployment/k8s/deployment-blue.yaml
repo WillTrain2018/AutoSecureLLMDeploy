@@ -1,0 +1,59 @@
+# Blue-green deploy, local-cluster version: this is the "blue" color.
+# Starts as the default active color (matching the "blue" fallback in the
+# deploy pipeline's color-detection step) with 2 replicas - one per node on
+# the 2-node docker-desktop/kind cluster. The idle color (deployment-green.yaml)
+# starts at 0 replicas and is scaled up only when a deploy targets it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tc-llm-blue
+  namespace: default
+  labels:
+    app: tc-llm
+    color: blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tc-llm
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: tc-llm
+        color: blue
+    spec:
+      imagePullSecrets:
+        - name: dockerhub-regcred   # created by the deploy pipeline, reuses this machine's `docker login`
+      containers:
+        - name: tc-llm
+          image: joecoursera/tc-llm:latest   # overwritten per-deploy via `kubectl set image`
+          imagePullPolicy: IfNotPresent   # each commit-sha tag is immutable, no need to always re-pull
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MODEL_NAME
+              value: "llama-3.1-8b"
+            - name: MODEL_VERSION
+              value: "v1.0.0"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

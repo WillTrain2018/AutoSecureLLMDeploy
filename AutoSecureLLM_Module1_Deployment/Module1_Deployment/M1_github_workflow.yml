@@ -17,8 +17,7 @@ on:
     branches:
       - main
     paths:
-      - 'app/**'
-      - 'Dockerfile'
+      - 'AutoSecureLLM_Module1_Deployment/Module1_Deployment/**'
       - '.github/workflows/**'
   pull_request:
     branches:
@@ -37,7 +36,7 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: techcorp-llm
+  ECR_REPOSITORY: tc-llm
   # TODO: Set these in GitHub repository secrets
   # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -78,26 +77,37 @@ jobs:
         with:
           images: ${{ env.ECR_REPOSITORY }}
           tags: |
-            type=sha,prefix=
+            type=sha,prefix=,format=long
             type=ref,event=branch
             type=semver,pattern={{version}}
-      
+
       - name: Build Docker image
         id: build
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: ./Dockerfile
+          # The actual Dockerfile/app code live under this nested module
+          # directory, not at the repo root - context and file must both
+          # point there (M1_Dockerfile.template's COPY instructions are
+          # relative to this directory, e.g. `COPY M1_app.py ./M1_app.py`).
+          context: ./AutoSecureLLM_Module1_Deployment/Module1_Deployment
+          file: ./AutoSecureLLM_Module1_Deployment/Module1_Deployment/M1_Dockerfile.template
           push: false  # Set to true after ECR is configured
+          load: true   # load the built image into the local daemon so the
+                        # "Save image for scanning" step below can find it
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Build arguments
+          # Build arguments consumed by M1_Dockerfile.template's
+          # ARG MODEL_VERSION / ARG BUILD_DATE
           build-args: |
             MODEL_VERSION=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
       
+      # Note: `type=sha,prefix=,format=long` above makes the sha tag equal
+      # the full ${{ github.sha }}, so this reference actually matches what
+      # was built (previously metadata-action's default short-sha tag
+      # didn't match this literal full-sha reference).
       - name: Save image for scanning
         run: |
           docker save ${{ env.ECR_REPOSITORY }}:${{ github.sha }} -o /tmp/image.tar

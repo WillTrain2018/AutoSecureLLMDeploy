@@ -1,0 +1,17 @@
+# Single stable entry point for both colors. Blue-green switching is just
+# this selector's `color` value flipping between "blue" and "green" - the
+# deploy pipeline does that with:
+#   kubectl patch service tc-llm -p '{"spec":{"selector":{"color":"green"}}}'
+apiVersion: v1
+kind: Service
+metadata:
+  name: tc-llm
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: tc-llm
+    color: blue
+  ports:
+    - port: 80
+      targetPort: 8000

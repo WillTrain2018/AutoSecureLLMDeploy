@@ -1,0 +1,372 @@
+# =============================================================================
+# TC-LLM Deploy Pipeline (with security scanning)
+# =============================================================================
+# STEP 1: triggers + env vars.
+# STEP 2: `build` job - checkout, Docker layer caching, build + tag the
+#         image with the commit SHA, Trivy scan gated on HIGH/CRITICAL
+#         findings.
+# STEP 3 (RECONFIGURED - no AWS): `deploy` job - blue-green switch over a
+#         LOCAL Kubernetes cluster (docker-desktop context, kind-based,
+#         2 nodes, k8s v1.36.4, `default` namespace), using the manifests
+#         in AutoSecureLLM_Module1_Deployment/Module1_Deployment/k8s/.
+#         AWS/ECR/ALB are no longer used anywhere in this file.
+#
+# STEP 3b (RECONFIGURED again - Docker Hub): images are pushed to and
+#         pulled from Docker Hub (docker.io/joecoursera/tc-llm), not loaded
+#         directly into cluster nodes. This simplifies the deploy job - no
+#         more branching on whether the cluster is kind-CLI-managed, since
+#         kubelet just pulls the tag like any other registry image.
+#
+#         HARD CONSTRAINT: GitHub-hosted runners cannot reach a cluster
+#         running on your own machine's localhost. The `deploy` job is
+#         pinned to `runs-on: self-hosted` for that reason - it will only
+#         run once you register a self-hosted runner on the same machine
+#         that runs docker-desktop/kind. `build` no longer has this
+#         constraint now that Docker Hub is the hand-off point between
+#         jobs, but stays on self-hosted too since that machine is already
+#         logged in to Docker Hub (`docker login`) and this avoids setting
+#         up registry credentials twice.
+#
+# One-page summaries: .github/workflows/deploy-llm.md (step 1)
+#                      .github/workflows/deploy-llm-build-scan.md (step 2)
+#                      .github/workflows/deploy-llm-blue-green.md (step 3, current kubectl-based logic)
+#                      .github/workflows/deploy-llm-local-k8s.md (why/how we pivoted off AWS)
+# =============================================================================
+
+name: TC-LLM Deploy Pipeline
+
+on:
+  # Code changes to the app/infra module itself.
+  push:
+    branches:
+      - main
+    paths:
+      - 'AutoSecureLLM_Module1_Deployment/Module1_Deployment/**'
+      - '.github/workflows/deploy-llm.yml'
+
+  # Model artifact updates: a new model version can land in the model
+  # bucket (see model_bucket in M1_variables.tf) independently of any code
+  # change. This workflow doesn't poll for that - an external process
+  # (e.g. a Lambda/EventBridge rule on S3 PutObject to the model bucket)
+  # fires it via the GitHub API:
+  #
+  #   POST /repos/{owner}/{repo}/dispatches
+  #   { "event_type": "model-artifact-updated",
+  #     "client_payload": { "model_name": "llama-3.1-8b", "model_version": "v1.0.1" } }
+  repository_dispatch:
+    types:
+      - model-artifact-updated
+
+  # Manual run for ad-hoc testing.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  # Docker Hub coordinates - IMAGE_NAME includes the namespace, so it
+  # resolves as docker.io/joecoursera/tc-llm with no extra registry prefix.
+  IMAGE_NAME: joecoursera/tc-llm
+  K8S_NAMESPACE: default
+
+jobs:
+  # ===========================================================================
+  # STEP 2: build the image, cache its layers, scan it with Trivy, and fail
+  # the job outright on any HIGH/CRITICAL finding.
+  #
+  # This job builds, caches, scans, and (only on a clean scan) pushes the
+  # image to Docker Hub. Deploying it is the `deploy` job below.
+  # ===========================================================================
+  build:
+    name: Build and Scan Container Image
+    # self-hosted: this machine is already logged in to Docker Hub, so
+    # building here avoids setting up registry credentials a second time
+    # on a hosted runner.
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      security-events: write   # required for the SARIF upload step below
+    outputs:
+      image_tag: ${{ steps.image.outputs.tag }}
+
+    steps:
+      - name: Show trigger context
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref:   ${{ github.ref }}"
+          echo "Image: docker.io/$IMAGE_NAME"
+
+      - name: Show model artifact payload (repository_dispatch only)
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          echo "Model name:    ${{ github.event.client_payload.model_name }}"
+          echo "Model version: ${{ github.event.client_payload.model_version }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Optional: this machine is already logged in to Docker Hub per
+      # `docker login`, so this step is a no-op safety net, not a hard
+      # requirement. It only does anything if DOCKERHUB_USERNAME/
+      # DOCKERHUB_TOKEN are configured as repo secrets (e.g. for a future
+      # runner that isn't already authenticated).
+      - name: Docker Hub login (optional)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not configured - assuming this runner is already logged in via 'docker login'."
+            exit 0
+          fi
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      # Tag format: joecoursera/tc-llm:<commit-sha> - a real Docker Hub
+      # reference, traceable to the exact commit it came from.
+      - name: Resolve image tag (commit SHA)
+        id: image
+        run: |
+          IMAGE="${IMAGE_NAME}:${GITHUB_SHA}"
+          echo "Resolved image tag: $IMAGE"
+          echo "tag=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Docker layer caching via actions/cache (see
+      # https://docs.docker.com/build/ci/github-actions/cache/). Keyed on
+      # the files that actually affect image layers - the Dockerfile, the
+      # weights-download script, and the pinned requirements - so the
+      # cache invalidates exactly when one of those changes, not on every
+      # commit (M1_app.py edits are deliberately excluded from the key).
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('AutoSecureLLM_Module1_Deployment/Module1_Deployment/M1_Dockerfile.template', 'AutoSecureLLM_Module1_Deployment/Module1_Deployment/M1_requirements.txt', 'AutoSecureLLM_Module1_Deployment/Module1_Deployment/download_model.py') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./AutoSecureLLM_Module1_Deployment/Module1_Deployment
+          file: ./AutoSecureLLM_Module1_Deployment/Module1_Deployment/M1_Dockerfile.template
+          load: true    # load into the local daemon so Trivy can scan it below
+          push: false   # pushed explicitly below, only after Trivy passes
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: |
+            MODEL_VERSION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      # actions/cache saves whatever's at `path` verbatim; building straight
+      # into that same directory would make the cache grow forever, so
+      # buildx writes to a separate "-new" dir above and we swap it in here.
+      - name: Move cache into place
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Failure threshold: exit-code 1 fails this step (and the job) the
+      # moment a HIGH or CRITICAL finding shows up. ignore-unfixed skips
+      # ones with no available patch yet - there's no action to take on
+      # those today, so failing the build on them would just be noise.
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image.outputs.tag }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # Deliberately placed AFTER the Trivy gate, not inside the build step
+      # above (which only builds+loads locally - push: false). A failed
+      # scan stops the job here by default, so a HIGH/CRITICAL image is
+      # never pushed to Docker Hub in the first place.
+      - name: Push image to Docker Hub
+        run: docker push ${{ steps.image.outputs.tag }}
+
+      # Runs even if the scan (or push) step above failed the job, so
+      # findings are still visible under the repo's Security tab for triage.
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ===========================================================================
+  # STEP 3 (RECONFIGURED): blue-green deploy over the local Kubernetes
+  # cluster, using the manifests in k8s/ - no AWS. Images are pulled from
+  # Docker Hub (joecoursera/tc-llm) by the cluster's own kubelet, same as
+  # any other registry-backed Deployment.
+  # ===========================================================================
+  deploy:
+    name: Blue-Green Deploy (local k8s)
+    needs: build
+    # self-hosted: must be the same machine running docker-desktop/kind -
+    # see the file header.
+    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' || github.event_name == 'repository_dispatch'
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Confirms kubectl is actually pointed at the expected local cluster
+      # before doing anything else - fails fast and clearly otherwise.
+      - name: Verify kubectl context
+        run: |
+          CONTEXT=$(kubectl config current-context)
+          echo "kubectl context: $CONTEXT"
+          kubectl get nodes -o wide
+
+      # Docker Hub is the hand-off point now, so there's no more "kind
+      # load" branching - kubelet just pulls joecoursera/tc-llm:<sha> like
+      # any other registry image once `kubectl set image` points at it
+      # below. The only local-cluster-specific piece left is giving the
+      # cluster credentials to pull it, in case the repo is private: this
+      # reuses the exact credentials already active on this machine (the
+      # same ones `docker login` wrote to ~/.docker/config.json) rather
+      # than asking for a second, separate login. Harmless if the repo
+      # turns out to be public - the secret just goes unused.
+      - name: Create/update Docker Hub imagePullSecret
+        run: |
+          kubectl create secret generic dockerhub-regcred \
+            --from-file=.dockerconfigjson="${HOME}/.docker/config.json" \
+            --type=kubernetes.io/dockerconfigjson \
+            --namespace "$K8S_NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Blue-green state (which color is currently live) is tracked in a
+      # ConfigMap rather than parsed off the Service, so it works even
+      # before the Service has ever been flipped once.
+      - name: Determine active and target colors
+        id: colors
+        run: |
+          ACTIVE=$(kubectl get configmap tc-llm-active-color -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.data.color}' 2>/dev/null || echo blue)
+          if [ "$ACTIVE" = "blue" ]; then TARGET=green; else TARGET=blue; fi
+          echo "Active color: $ACTIVE -> deploying to: $TARGET"
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+      # Idempotent: ensures the Service and both color Deployments exist
+      # (first run) without disturbing whichever one is currently live.
+      - name: Apply base manifests
+        run: |
+          kubectl apply -n "$K8S_NAMESPACE" -f AutoSecureLLM_Module1_Deployment/Module1_Deployment/k8s/service.yaml
+          kubectl apply -n "$K8S_NAMESPACE" -f AutoSecureLLM_Module1_Deployment/Module1_Deployment/k8s/deployment-blue.yaml
+          kubectl apply -n "$K8S_NAMESPACE" -f AutoSecureLLM_Module1_Deployment/Module1_Deployment/k8s/deployment-green.yaml
+
+      # Point the idle color at the new image and scale it up to 2 replicas
+      # (one per node on this 2-node cluster).
+      - name: Deploy image to target color
+        run: |
+          kubectl set image deployment/tc-llm-${{ steps.colors.outputs.target }} \
+            tc-llm="${{ needs.build.outputs.image_tag }}" -n "$K8S_NAMESPACE"
+          kubectl scale deployment/tc-llm-${{ steps.colors.outputs.target }} \
+            --replicas=2 -n "$K8S_NAMESPACE"
+
+      # Pre-flip validation: `kubectl rollout status` blocks until every
+      # replica's containers are Ready - i.e. until the readinessProbe
+      # hitting /health/ready in the Deployment manifest passes - or times
+      # out. Traffic is never switched to a color that didn't pass this.
+      - name: Validate target color health (pre-flip)
+        run: |
+          kubectl rollout status deployment/tc-llm-${{ steps.colors.outputs.target }} \
+            -n "$K8S_NAMESPACE" --timeout=120s
+
+      # Flip the Service selector to the now-healthy color. This is the
+      # entire "traffic switch" - the Service's ClusterIP never changes,
+      # only which pods it routes to.
+      - name: Switch Service traffic to target color
+        id: switch
+        run: |
+          kubectl patch service tc-llm -n "$K8S_NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"color\":\"${{ steps.colors.outputs.target }}\"}}}"
+          echo "Switched tc-llm Service to ${{ steps.colors.outputs.target }}."
+
+      # Post-flip smoke test: port-forward the Service (ClusterIP isn't
+      # reachable from outside the cluster network) and hit the same
+      # /health/ready endpoint for real, confirming actual traffic through
+      # the Service - not just that the pods self-report healthy.
+      - name: Post-flip smoke test
+        run: |
+          kubectl port-forward service/tc-llm 18080:80 -n "$K8S_NAMESPACE" &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null' EXIT
+          sleep 3
+          for i in $(seq 1 15); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18080/health/ready || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "Smoke test passed."
+              exit 0
+            fi
+            echo "Attempt $i/15: HTTP $CODE"
+            sleep 5
+          done
+          echo "::error::Post-flip smoke test against /health/ready failed."
+          exit 1
+
+      # Automatic rollback: only runs if something after the traffic switch
+      # failed (the post-flip smoke test). Flips the Service straight back
+      # and scales the never-actually-good target color back down to 0.
+      - name: Rollback to previous color on failure
+        if: failure() && steps.switch.outcome == 'success'
+        run: |
+          kubectl patch service tc-llm -n "$K8S_NAMESPACE" \
+            -p "{\"spec\":{\"selector\":{\"color\":\"${{ steps.colors.outputs.active }}\"}}}"
+          kubectl scale deployment/tc-llm-${{ steps.colors.outputs.target }} --replicas=0 -n "$K8S_NAMESPACE"
+          echo "::warning::Rolled back - Service traffic restored to ${{ steps.colors.outputs.active }}."
+
+      # Only recorded once the new color is confirmed live and healthy -
+      # so a rolled-back deploy leaves the recorded active color unchanged.
+      # Also scales the now-idle old color down to 0 to free up the
+      # 2-node cluster's resources.
+      - name: Record new active color and scale down the old one
+        if: success()
+        run: |
+          kubectl create configmap tc-llm-active-color -n "$K8S_NAMESPACE" \
+            --from-literal=color="${{ steps.colors.outputs.target }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl scale deployment/tc-llm-${{ steps.colors.outputs.active }} --replicas=0 -n "$K8S_NAMESPACE"
+          echo "Active color is now ${{ steps.colors.outputs.target }}; ${{ steps.colors.outputs.active }} scaled to 0."
+
+      # Always-on notification: writes to the run's own summary page, which
+      # needs no secrets/webhooks to work. Slack is additionally posted
+      # only if SLACK_WEBHOOK_URL has been configured as a secret.
+      - name: Post deployment status summary
+        if: always()
+        run: |
+          {
+            echo "### TC-LLM Deployment - ${{ job.status }}"
+            echo "- Namespace: $K8S_NAMESPACE"
+            echo "- Image: ${{ needs.build.outputs.image_tag }}"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Target color: ${{ steps.colors.outputs.target }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack (optional)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not configured - skipping Slack notification."
+            exit 0
+          fi
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"TC-LLM local k8s deploy: ${{ job.status }} (image ${{ needs.build.outputs.image_tag }})\"}" \
+            "$SLACK_WEBHOOK_URL"

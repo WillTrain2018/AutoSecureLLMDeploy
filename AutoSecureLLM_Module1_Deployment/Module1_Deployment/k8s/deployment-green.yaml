@@ -1,0 +1,57 @@
+# The "green" color - idle by default (replicas: 0). The deploy pipeline
+# scales this up, points a new image at it, validates it, then flips the
+# Service selector to it - see deployment-blue.yaml for the full comment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tc-llm-green
+  namespace: default
+  labels:
+    app: tc-llm
+    color: green
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: tc-llm
+      color: green
+  template:
+    metadata:
+      labels:
+        app: tc-llm
+        color: green
+    spec:
+      imagePullSecrets:
+        - name: dockerhub-regcred   # created by the deploy pipeline, reuses this machine's `docker login`
+      containers:
+        - name: tc-llm
+          image: joecoursera/tc-llm:latest   # overwritten per-deploy via `kubectl set image`
+          imagePullPolicy: IfNotPresent   # each commit-sha tag is immutable, no need to always re-pull
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MODEL_NAME
+              value: "llama-3.1-8b"
+            - name: MODEL_VERSION
+              value: "v1.0.0"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
